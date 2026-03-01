@@ -1,0 +1,2359 @@
+"""
+Services for exam operations - separates business logic from models and views
+"""
+
+import logging
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.utils import timezone
+from questions.models import Question
+import io
+import zipfile
+
+from .exam_algorithms import round_robin_shuffle_choices
+from .models import Exam, ExamExportHistory, Variant, VariantQuestion
+from .pdf_exporter import PDFExporter
+from .docx_exporter import DOCXExporter
+
+logger = logging.getLogger(__name__)
+
+
+class ExamValidationService:
+    """Service for validating exam configuration"""
+
+    @staticmethod
+    def validate_exam_config(exam: Exam) -> List[str]:
+        """Validate exam configuration and return list of errors"""
+        errors = []
+
+        # Validate difficulty distribution
+        total = (
+            int(getattr(exam, "easy_percentage", 0))
+            + int(getattr(exam, "medium_percentage", 0))
+            + int(getattr(exam, "hard_percentage", 0))
+        )
+        # Allow sum <= 100 (remainder is Unknown)
+        if total > 100 or total < 0:
+            errors.append(
+                (
+                    "Difficulty distribution must add up to 100% or less "
+                    "(remainder will be filled with questions of unknown difficulty)"
+                )
+            )
+
+        # Validate question count from sections
+        from questions.models import Question
+        available_questions = []
+        for section in exam.sections.all():
+            for question_bank in section.question_banks.all():
+                bank_questions = Question.objects.filter(bank=question_bank)
+                available_questions.extend(bank_questions)
+        
+        # Remove duplicates
+        available_question_ids = set(q.id for q in available_questions)
+        total_available = len(available_question_ids)
+        
+        if total_available < exam.questions_per_variant:
+            errors.append(
+                (
+                    f"Not enough questions in selected banks. Need {exam.questions_per_variant}, "
+                    f"have {total_available}"
+                )
+            )
+
+        # Validate mandatory questions
+        mandatory_count = getattr(exam, "mandatory_questions").all().count()
+        if exam.questions_per_variant < mandatory_count:
+            errors.append(
+                (
+                    f"Number of questions per variant ({exam.questions_per_variant}) "
+                    f"is less than mandatory questions ({mandatory_count})"
+                )
+            )
+
+        # Validate variant count
+        if exam.num_variants < 1 or exam.num_variants > 5:
+            errors.append("Number of variants must be between 1 and 5")
+
+        return errors
+
+    @staticmethod
+    def validate_variant_generation(exam: Exam) -> List[str]:
+        """Validate if variants can be generated"""
+        errors = ExamValidationService.validate_exam_config(exam)
+
+        if errors:
+            return errors
+
+        # Check if we have enough questions for unique mode
+        if not exam.allow_reuse:
+            mandatory_count = getattr(exam, "mandatory_questions").all().count()
+            non_mandatory_needed = exam.questions_per_variant - mandatory_count
+            total_non_mandatory_needed = non_mandatory_needed * exam.num_variants
+            
+            # Get available questions from sections
+            from questions.models import Question
+            available_questions = []
+            for section in exam.sections.all():
+                for question_bank in section.question_banks.all():
+                    bank_questions = Question.objects.filter(bank=question_bank)
+                    available_questions.extend(bank_questions)
+            
+            # Remove duplicates and mandatory questions
+            available_question_ids = set(q.id for q in available_questions)
+            mandatory_question_ids = set(getattr(exam, "mandatory_questions").values_list("id", flat=True))
+            available_non_mandatory_ids = available_question_ids - mandatory_question_ids
+            available_non_mandatory = len(available_non_mandatory_ids)
+
+            if available_non_mandatory < total_non_mandatory_needed:
+                errors.append(
+                    (
+                        "Not enough unique questions in selected banks. "
+                        f"Need {total_non_mandatory_needed}, "
+                        f"have {available_non_mandatory}"
+                    )
+                )
+        return errors
+
+
+class VariantGenerationService:
+    """Service for generating exam variants"""
+
+    @staticmethod
+    def _apply_anti_cheating_measures(variants: List[Variant]) -> None:
+        """
+        Apply anti-cheating measures to prevent adjacent seat
+        cheating by optimizing answer distribution
+        """
+        if len(variants) < 2:
+            return  # Need at least 2 variants for adjacent seat prevention
+
+        # Get all variant questions in order
+        variant_questions = []
+        for variant in variants:
+            questions = (
+                getattr(variant, "variantquestion_set")
+                .select_related("question")
+                .order_by("order")
+            )
+            variant_questions.append([vq for vq in questions])
+
+        # Simple but effective optimization: ensure adjacent variants have
+        # different answer patterns
+        VariantGenerationService._simple_anti_cheating_optimization(
+            variants, variant_questions
+        )
+
+        # Log the final cheating risk assessment
+        VariantGenerationService._assess_final_cheating_risk(
+            variants, variant_questions
+        )
+
+    @staticmethod
+    def _simple_anti_cheating_optimization(
+        variants: List[Variant], variant_questions: List[List]
+    ) -> None:
+        """Simple but effective anti-cheating optimization"""
+        max_questions = max(len(qs) for qs in variant_questions)
+
+        # For each position, check if adjacent variants have the same answer
+        # If they do, try to swap with a position where they have different answers
+        for pos in range(max_questions):
+            VariantGenerationService._fix_position_simple(
+                variants, variant_questions, pos
+            )
+
+    @staticmethod
+    def _fix_position_simple(
+        variants: List[Variant], variant_questions: List[List], position: int
+    ) -> None:
+        """Fix a single position by swapping questions to reduce adjacent overlaps"""
+        # Get answers at this position for all variants
+        position_answers = []
+        for variant_qs in variant_questions:
+            if position < len(variant_qs):
+                vq = variant_qs[position]
+                correct_answer = VariantGenerationService._get_correct_answer(vq)
+                position_answers.append(correct_answer)
+            else:
+                position_answers.append(None)
+
+        # Find adjacent vulnerabilities
+        vulnerabilities = []
+        for i in range(len(position_answers) - 1):
+            if (
+                position_answers[i] is not None
+                and position_answers[i + 1] is not None
+                and position_answers[i] == position_answers[i + 1]
+            ):
+                vulnerabilities.append((i, i + 1))
+
+        if not vulnerabilities:
+            return  # No vulnerabilities at this position
+
+        # Try to fix each vulnerability by swapping with another position
+        for v1_idx, v2_idx in vulnerabilities:
+            VariantGenerationService._try_swap_to_fix_vulnerability(
+                variants, variant_questions, position, v1_idx, v2_idx
+            )
+
+    @staticmethod
+    def _try_swap_to_fix_vulnerability(
+        variants: List[Variant],
+        variant_questions: List[List],
+        position: int,
+        v1_idx: int,
+        v2_idx: int,
+    ) -> None:
+        """Try to fix a vulnerability by swapping questions with another position"""
+        max_questions = len(variant_questions[0])
+
+        # Look for a position where these two variants have different answers
+        for other_pos in range(max_questions):
+            if other_pos == position:
+                continue
+
+            # Check if both variants have questions at this position
+            if other_pos >= len(variant_questions[v1_idx]) or other_pos >= len(
+                variant_questions[v2_idx]
+            ):
+                continue
+
+            # Get answers at the other position
+            v1_other = variant_questions[v1_idx][other_pos]
+            v2_other = variant_questions[v2_idx][other_pos]
+
+            v1_other_answer = VariantGenerationService._get_correct_answer(v1_other)
+            v2_other_answer = VariantGenerationService._get_correct_answer(v2_other)
+
+            # If they have different answers at the other position, swapping might help
+            if v1_other_answer != v2_other_answer:
+                # Get current answers
+                v1_current = variant_questions[v1_idx][position]
+                v2_current = variant_questions[v2_idx][position]
+
+                v1_current_answer = VariantGenerationService._get_correct_answer(
+                    v1_current
+                )
+                v2_current_answer = VariantGenerationService._get_correct_answer(
+                    v2_current
+                )
+
+                # Check if swapping would break the vulnerability
+                if (
+                    v1_other_answer != v2_current_answer
+                    and v2_other_answer != v1_current_answer
+                ):
+                    # Perform the swap
+                    try:
+                        VariantGenerationService._swap_variant_questions(
+                            variants[v1_idx], variants[v2_idx], position, other_pos
+                        )
+
+                        # Update our local data structure
+                        (
+                            variant_questions[v1_idx][position],
+                            variant_questions[v1_idx][other_pos],
+                        ) = (
+                            variant_questions[v1_idx][other_pos],
+                            variant_questions[v1_idx][position],
+                        )
+                        (
+                            variant_questions[v2_idx][position],
+                            variant_questions[v2_idx][other_pos],
+                        ) = (
+                            variant_questions[v2_idx][other_pos],
+                            variant_questions[v2_idx][position],
+                        )
+
+                        logger.info(
+                            (
+                                "Swapped questions between variants "
+                                f"{v1_idx} and {v2_idx} at positions "
+                                f"{position} and {other_pos}"
+                            )
+                        )
+
+                        return  # Successfully fixed this vulnerability
+                    except Exception:
+                        logger.warning(
+                            (
+                                "Could not find a good swap to fix vulnerability "
+                                "between variants %s and %s "
+                                "at position %s"
+                            ),
+                            v1_idx,
+                            v2_idx,
+                            position,
+                        )
+                        continue
+
+        logger.warning(
+            (
+                "Could not find a good swap to fix vulnerability "
+                "between variants %s and %s "
+                "at position %s"
+            ),
+            v1_idx,
+            v2_idx,
+            position,
+        )
+
+    @staticmethod
+    def _get_correct_answer(vq) -> tuple:
+        """Get the correct answer for a variant question in comparable format"""
+        if vq.randomized_correct_answer:
+            correct_answer = vq.randomized_correct_answer
+        else:
+            correct_answer = vq.question.correct_answer
+
+        if isinstance(correct_answer, list):
+            return tuple(sorted(correct_answer))
+        else:
+            return (correct_answer,)
+
+    @staticmethod
+    def _swap_variant_questions(
+        variant1: Variant, variant2: Variant, pos1: int, pos2: int
+    ) -> None:
+        """
+        Swap questions between two variants at specified positions,
+        avoiding unique constraint violations
+        """
+        vq1_pos1 = variant1.variantquestion_set.get(order=pos1)
+        vq2_pos1 = variant2.variantquestion_set.get(order=pos1)
+        # Check if either variant already has the other's question (other than at pos1)
+        if (
+            variant1.variantquestion_set.exclude(order=pos1)
+            .filter(question=vq2_pos1.question)
+            .exists()
+            or variant2.variantquestion_set.exclude(order=pos1)
+            .filter(question=vq1_pos1.question)
+            .exists()
+        ):
+            logger.warning(
+                "Swap would violate unique constraint: %s <-> %s at pos %s",
+                variant1,
+                variant2,
+                pos1,
+            )
+            return  # Skip swap
+        # Swap the questions
+        vq1_pos1.question, vq2_pos1.question = vq2_pos1.question, vq1_pos1.question
+        vq1_pos1.save()
+        vq2_pos1.save()
+
+    @staticmethod
+    def _assess_final_cheating_risk(
+        variants: List[Variant], variant_questions: List[List]
+    ) -> None:
+        """Assess the final cheating risk after optimization"""
+        max_questions = (
+            max(len(qs) for qs in variant_questions) if variant_questions else 0
+        )
+        if max_questions == 0:
+            logger.info("No questions to assess for cheating risk")
+            return
+
+        vulnerabilities_found = 0
+        total_possible_adjacencies = 0
+
+        for pos in range(max_questions):
+            position_answers = []
+            for variant_qs in variant_questions:
+                if pos < len(variant_qs):
+                    vq = variant_qs[pos]
+                    correct_answer = VariantGenerationService._get_correct_answer(vq)
+                    position_answers.append(correct_answer)
+                else:
+                    position_answers.append(None)
+
+            # Count adjacent vulnerabilities at this position
+            for i in range(len(position_answers) - 1):
+                if (
+                    position_answers[i] is not None
+                    and position_answers[i + 1] is not None
+                ):
+                    total_possible_adjacencies += 1
+                    if position_answers[i] == position_answers[i + 1]:
+                        vulnerabilities_found += 1
+                        logger.warning(
+                            (
+                                "Remaining vulnerability at position "
+                                f"{pos} between variants {i} and {i+1}"
+                            )
+                        )
+
+        if total_possible_adjacencies > 0:
+            risk_percentage = (vulnerabilities_found / total_possible_adjacencies) * 100
+            logger.info(
+                "Final cheating risk assessment: %s/%s "
+                "adjacent pairs vulnerable (%.1f%%)",
+                vulnerabilities_found,
+                total_possible_adjacencies,
+                risk_percentage,
+            )
+        else:
+            logger.info("No adjacent pairs to assess for cheating risk")
+
+    @staticmethod
+    def calculate_cheating_risk(variants: List[Variant]) -> float:
+        """
+        Calculate cheating risk percentage based on
+        adjacent answer overlaps (public for tests)
+        """
+        if len(variants) < 2:
+            return 0.0
+
+        variant_questions = []
+        for variant in variants:
+            questions = (
+                getattr(variant, "variantquestion_set")
+                .select_related("question")
+                .order_by("order")
+            )
+            variant_questions.append([vq for vq in questions])
+
+        max_questions = (
+            max(len(qs) for qs in variant_questions) if variant_questions else 0
+        )
+        if max_questions == 0:
+            return 0.0
+
+        vulnerabilities_found = 0
+        total_possible_adjacencies = 0
+
+        for pos in range(max_questions):
+            position_answers = []
+            for variant_qs in variant_questions:
+                if pos < len(variant_qs):
+                    vq = variant_qs[pos]
+                    correct_answer = VariantGenerationService._get_correct_answer(vq)
+                    position_answers.append(correct_answer)
+                else:
+                    position_answers.append(None)
+
+            # Count how many adjacent pairs we can check at this position
+            valid_adjacencies = 0
+            matching_adjacencies = 0
+
+            for i in range(len(position_answers) - 1):
+                if (
+                    position_answers[i] is not None
+                    and position_answers[i + 1] is not None
+                ):
+                    valid_adjacencies += 1
+                    if position_answers[i] == position_answers[i + 1]:
+                        matching_adjacencies += 1
+
+            total_possible_adjacencies += valid_adjacencies
+            vulnerabilities_found += matching_adjacencies
+
+        if total_possible_adjacencies > 0:
+            return (vulnerabilities_found / total_possible_adjacencies) * 100
+        return 0.0
+
+    @staticmethod
+    def generate_variants(exam: Exam) -> dict:
+        """
+        Generate exam variants with proper error
+        handling and anti-cheating measures
+        Also returns analytics metrics for frontend analytics cards.
+        Returns a dict with analytics and variant IDs (not ORM objects).
+        """
+
+        # Defensive: Cast all config values to int, handle None/'' as 0
+        def safe_int(val, default=0):
+            if val is None or val == "":
+                return default
+            try:
+                return int(val)
+            except Exception:
+                return default
+
+        num_variants = safe_int(exam.num_variants, 1)
+        questions_per_variant = safe_int(exam.questions_per_variant, 1)
+        easy_percentage = safe_int(exam.easy_percentage, 0)
+        medium_percentage = safe_int(exam.medium_percentage, 0)
+        hard_percentage = safe_int(exam.hard_percentage, 0)
+        question_budget = safe_int(exam.question_budget, 200)
+        logger.info(
+            (
+                "VariantGen config: "
+                f"num_variants={num_variants} ({type(num_variants)}), "
+                f"questions_per_variant={questions_per_variant} "
+                f"({type(questions_per_variant)}), "
+                f"easy={easy_percentage} ({type(easy_percentage)}), "
+                f"medium={medium_percentage} ({type(medium_percentage)}), "
+                f"hard={hard_percentage} ({type(hard_percentage)}), "
+                f"budget={question_budget} ({type(question_budget)})"
+            )
+        )
+
+        # Validate before generation
+        errors = ExamValidationService.validate_variant_generation(exam)
+        if errors:
+            raise ValidationError("; ".join(errors))
+        with transaction.atomic():
+            # Clear existing variants
+            getattr(exam, "variants").all().delete()
+            # Get question pools from sections instead of manually added questions
+            from questions.models import Question
+            
+            mandatory_questions = list(getattr(exam, "mandatory_questions").all())
+            
+            # Get questions from all sections' question banks with section mapping
+            section_questions = {}
+            total_available_questions = 0
+            
+            for section in exam.sections.all():
+                section_questions[section.id] = {
+                    'section': section,
+                    'questions': [],
+                    'max_questions': section.configured_question_count or 5
+                }
+                
+                for question_bank in section.question_banks.all():
+                    bank_questions = Question.objects.filter(bank=question_bank)
+                    section_questions[section.id]['questions'].extend(bank_questions)
+                    total_available_questions += len(bank_questions)
+            
+            # Remove duplicates and mandatory questions from each section
+            for section_id, section_data in section_questions.items():
+                section_question_ids = set(q.id for q in section_data['questions'])
+                mandatory_question_ids = set(q.id for q in mandatory_questions)
+                section_question_ids -= mandatory_question_ids
+                section_data['questions'] = list(Question.objects.filter(id__in=section_question_ids))
+            
+            # Calculate proportional distribution
+            questions_per_variant = safe_int(exam.questions_per_variant, 1)
+            mandatory_count = len(mandatory_questions)
+            non_mandatory_per_variant = max(0, questions_per_variant - mandatory_count)
+            
+            # Calculate section proportions
+            section_allocation = {}
+            total_max_questions = sum(section_data['max_questions'] for section_data in section_questions.values())
+            
+            if total_max_questions > 0:
+                for section_id, section_data in section_questions.items():
+                    proportion = section_data['max_questions'] / total_max_questions
+                    section_allocation[section_id] = max(1, round(non_mandatory_per_variant * proportion))
+            else:
+                # Fallback: distribute evenly
+                num_sections = len(section_questions)
+                if num_sections > 0:
+                    questions_per_section = max(1, non_mandatory_per_variant // num_sections)
+                    for section_id in section_questions.keys():
+                        section_allocation[section_id] = questions_per_section
+            
+            # Validate section allocation
+            total_allocated = sum(section_allocation.values())
+            if total_allocated != non_mandatory_per_variant:
+                # Adjust to match exactly
+                diff = non_mandatory_per_variant - total_allocated
+                if diff > 0:
+                    # Add to largest section
+                    largest_section = max(section_allocation.items(), key=lambda x: x[1])[0]
+                    section_allocation[largest_section] += diff
+                elif diff < 0:
+                    # Subtract from largest section
+                    largest_section = max(section_allocation.items(), key=lambda x: x[1])[0]
+                    section_allocation[largest_section] = max(1, section_allocation[largest_section] + diff)
+            
+            logger.info(f"Section allocation: {section_allocation}")
+            logger.info(f"Non-mandatory questions per variant: {non_mandatory_per_variant}")
+            
+            # Flatten available questions for backward compatibility
+            available_questions = []
+            for section_data in section_questions.values():
+                available_questions.extend(section_data['questions'])
+            
+            # Log the question distribution for debugging
+            logger.info(f"Mandatory questions: {len(mandatory_questions)}")
+            logger.info(f"Available non-mandatory questions: {len(available_questions)}")
+            logger.info(f"Questions per variant: {questions_per_variant}")
+            logger.info(f"Mandatory questions per variant: {len(mandatory_questions)}")
+            logger.info(f"Remaining questions to distribute: {questions_per_variant - len(mandatory_questions)}")
+            variants = []
+            # Use local variables for all further logic
+            n_variants = min(num_variants, 5)
+            q_per_variant = questions_per_variant
+            n_mandatory = len(mandatory_questions)
+            n_non_mandatory = max(0, q_per_variant - n_mandatory)
+            if exam.allow_reuse:
+                variants, distribution_info = (
+                    VariantGenerationService._generate_section_based_variants(
+                        exam,
+                        mandatory_questions,
+                        section_questions,
+                        section_allocation,
+                        n_variants,
+                        n_non_mandatory,
+                        reuse_mode=True
+                    )
+                )
+                if distribution_info["auto_balance_disabled"]:
+                    logger.warning(
+                        "Auto-balance disabled for reuse mode. "
+                        "Some difficulties might not be distributed fairly."
+                    )
+                    # Clear again to be extra safe
+                    getattr(exam, "variants").all().delete()
+                    variants, distribution_info = (
+                        VariantGenerationService._generate_section_based_variants(
+                            exam,
+                            mandatory_questions,
+                            section_questions,
+                            section_allocation,
+                            n_variants,
+                            n_non_mandatory,
+                            reuse_mode=True
+                        )
+                    )
+                    setattr(exam, "easy_percentage", 0)
+                    setattr(exam, "medium_percentage", 0)
+                    setattr(exam, "hard_percentage", 0)
+                    exam.save()
+            else:
+                variants, warning, distribution_info = (
+                    VariantGenerationService._generate_section_based_variants(
+                        exam,
+                        mandatory_questions,
+                        section_questions,
+                        section_allocation,
+                        n_variants,
+                        n_non_mandatory,
+                        reuse_mode=False
+                    )
+                )
+                if variants is None and warning:
+                    logger.warning(warning)
+                    # Clear again to be extra safe
+                    getattr(exam, "variants").all().delete()
+                    variants = VariantGenerationService._generate_section_based_variants(
+                        exam,
+                        mandatory_questions,
+                        section_questions,
+                        section_allocation,
+                        n_variants,
+                        n_non_mandatory,
+                        reuse_mode=True
+                    )
+                    setattr(exam, "easy_percentage", 0)
+                    setattr(exam, "medium_percentage", 0)
+                    setattr(exam, "hard_percentage", 0)
+                    exam.save()
+            # Apply choice randomization if requested
+            if exam.randomize_choices:
+                VariantGenerationService._randomize_choices(variants)
+
+            # Apply anti-cheating measures
+            if exam.randomize_questions or exam.randomize_choices:
+                VariantGenerationService._apply_anti_cheating_measures(variants)
+
+            # --- Analytics for frontend ---
+            cheating_risk = VariantGenerationService.calculate_cheating_risk(variants)
+            # Calculate question reuse rate
+            all_questions = [
+                vq.question.id
+                for variant in variants
+                for vq in getattr(variant, "variantquestion_set").all()
+            ]
+            unique_questions = set(all_questions)
+            question_reuse_rate = (
+                100 * (1 - len(unique_questions) / len(all_questions))
+                if all_questions
+                else 0
+            )
+            # Calculate mandatory overlap (average times a mandatory appears in the
+            # same position across variants)
+            mandatory_ids = set(q.id for q in mandatory_questions)
+            if mandatory_ids and len(variants) > 1:
+                total_positions = 0
+                overlap_count = 0
+                for pos in range(questions_per_variant):
+                    ids_at_pos = [
+                        vq.question.id
+                        for variant in variants
+                        for vq in getattr(variant, "variantquestion_set").order_by(
+                            "order"
+                        )
+                        if vq.order == pos
+                    ]
+                    for mid in mandatory_ids:
+                        count = ids_at_pos.count(mid)
+                        if count > 1:
+                            overlap_count += count - 1
+                        total_positions += 1
+                if total_positions > 0:
+                    # mandatory_overlap = round(
+                    #     100 * overlap_count / total_positions, 2
+                    # )
+                    pass  # Variable is not used, so just pass
+            # Calculate per-variant difficulty distribution
+            per_variant_difficulties = []
+            for variant in variants:
+                vqs = getattr(variant, "variantquestion_set").all()
+                easy_count = sum(
+                    1 for vq in vqs if getattr(vq.question, "difficulty", None) == 1
+                )
+                medium_count = sum(
+                    1 for vq in vqs if getattr(vq.question, "difficulty", None) == 2
+                )
+                hard_count = sum(
+                    1 for vq in vqs if getattr(vq.question, "difficulty", None) == 3
+                )
+                unknown_count = sum(
+                    1
+                    for vq in vqs
+                    if getattr(vq.question, "difficulty", None) not in [1, 2, 3]
+                )
+                per_variant_difficulties.append(
+                    {
+                        "Easy": easy_count,
+                        "Medium": medium_count,
+                        "Hard": hard_count,
+                        "Unknown": unknown_count,
+                    }
+                )
+            # Calculate answer diversity as average Hamming distance between answer
+            # patterns, normalized
+
+            def hamming(a, b):
+                return sum(x != y for x, y in zip(a, b))
+
+            answer_patterns = []
+            for variant in variants:
+                vqs = getattr(variant, "variantquestion_set").order_by("order")
+                pattern = []
+                for vq in vqs:
+                    if vq.randomized_correct_answer:
+                        answer = vq.randomized_correct_answer
+                    else:
+                        answer = (
+                            vq.question.correct_answer
+                            if isinstance(vq.question.correct_answer, list)
+                            else [vq.question.correct_answer]
+                        )
+                    pattern.append(tuple(answer))
+                answer_patterns.append(pattern)
+            # Debug: print answer patterns and question IDs for each variant
+            logger.info(f"[ANALYTICS DEBUG] Number of variants: {len(variants)}")
+            for idx, variant in enumerate(variants):
+                vqs = list(getattr(variant, "variantquestion_set").order_by("order"))
+                logger.info(
+                    f"[ANALYTICS DEBUG] Variant {idx+1} (ID {variant.id}): "
+                    f"num_questions={len(vqs)}"
+                )
+                qids = [vq.question.id for vq in vqs]
+                ans = [vq.randomized_correct_answer for vq in vqs]
+                logger.info(f"[ANALYTICS DEBUG]   QIDs={qids}")
+                logger.info(f"[ANALYTICS DEBUG]   Answers={ans}")
+            logger.info(f"[ANALYTICS DEBUG] answer_patterns={answer_patterns}")
+            hamming_distances = [
+                hamming(answer_patterns[i], answer_patterns[j])
+                for i in range(len(answer_patterns))
+                for j in range(i + 1, len(answer_patterns))
+            ]
+            max_hamming = questions_per_variant if len(variants) > 1 else 1
+            avg_hamming = (
+                round(
+                    (
+                        sum(hamming_distances)
+                        / len(hamming_distances)
+                        / max_hamming
+                        * 100
+                    ),
+                    2,
+                )
+                if hamming_distances and max_hamming
+                else 0.0
+            )
+            # Unique answer patterns
+            unique_patterns = len(set(tuple(p) for p in answer_patterns))
+            logger.info(f"[ANALYTICS DEBUG] answer_patterns={answer_patterns}")
+            logger.info(f"[ANALYTICS DEBUG] unique_patterns={unique_patterns}")
+            if len(variants) > 0:
+                if getattr(exam, "allow_reuse", False):
+                    variant_uniqueness = round(100 * unique_patterns / len(variants), 2)
+                else:
+                    variant_uniqueness = 100.0
+                logger.info(
+                    f"[ANALYTICS DEBUG] variant_uniqueness={variant_uniqueness}"
+                )
+            else:
+                variant_uniqueness = None
+            analytics = {
+                "cheating_risk": cheating_risk,
+                "answer_diversity": avg_hamming,
+                "variant_uniqueness": variant_uniqueness,
+                "question_reuse_rate": (
+                    round(question_reuse_rate, 2)
+                    if not getattr(exam, "allow_reuse", False)
+                    else None
+                ),
+            }
+            # Always include variant_uniqueness in reuse mode, never None
+            if getattr(exam, "allow_reuse", False):
+                analytics["variant_uniqueness"] = float(variant_uniqueness)
+            # Add final_score
+            if getattr(exam, "allow_reuse", False):
+                analytics["final_score"] = round(
+                    (avg_hamming + float(variant_uniqueness)) / 2, 2
+                )
+            else:
+                analytics["final_score"] = round(
+                    (avg_hamming + (100 - question_reuse_rate)) / 2, 2
+                )
+            logger.info(f"[ANALYTICS DEBUG] analytics dict before return: {analytics}")
+            return {
+                "analytics": analytics,
+                "variant_ids": [variant.id for variant in variants],
+            }
+
+    @staticmethod
+    def _generate_reuse_variants(
+        exam: Exam,
+        mandatory_questions: List[Question],
+        available_questions: List[Question],
+        num_variants: int,
+        num_non_mandatory: int,
+    ) -> Tuple[List[Variant], dict]:
+        import logging
+        import random
+
+        logger = logging.getLogger(__name__)
+        variants = []
+        # Precompute original difficulty pools
+        orig_pool_by_diff = {"Easy": [], "Medium": [], "Hard": [], "Unknown": []}
+        for q in available_questions:
+            if q.difficulty == 1:
+                orig_pool_by_diff["Easy"].append(q)
+            elif q.difficulty == 2:
+                orig_pool_by_diff["Medium"].append(q)
+            elif q.difficulty == 3:
+                orig_pool_by_diff["Hard"].append(q)
+            else:
+                orig_pool_by_diff["Unknown"].append(q)
+        # Precompute mandatory by difficulty
+        mandatory_by_diff = {"Easy": [], "Medium": [], "Hard": [], "Unknown": []}
+        for q in mandatory_questions:
+            if q.difficulty == 1:
+                mandatory_by_diff["Easy"].append(q)
+            elif q.difficulty == 2:
+                mandatory_by_diff["Medium"].append(q)
+            elif q.difficulty == 3:
+                mandatory_by_diff["Hard"].append(q)
+            else:
+                mandatory_by_diff["Unknown"].append(q)
+        easy_pct = int(exam.easy_percentage)
+        med_pct = int(exam.medium_percentage)
+        hard_pct = int(exam.hard_percentage)
+        n_total = exam.questions_per_variant
+        mand_easy = len(mandatory_by_diff["Easy"])
+        mand_med = len(mandatory_by_diff["Medium"])
+        mand_hard = len(mandatory_by_diff["Hard"])
+        mand_unknown = len(mandatory_by_diff["Unknown"])
+        n_easy = max(0, round((easy_pct / 100) * n_total) - mand_easy)
+        n_med = max(0, round((med_pct / 100) * n_total) - mand_med)
+        n_hard = max(0, round((hard_pct / 100) * n_total) - mand_hard)
+        n_unknown = max(
+            0,
+            n_total
+            - (mand_easy + mand_med + mand_hard + mand_unknown)
+            - n_easy
+            - n_med
+            - n_hard,
+        )
+        # Build the single set of questions to be used in all variants
+        selected_questions = []
+        # Add all mandatory questions (no duplicates)
+        seen_ids = set()
+        for q in mandatory_questions:
+            if q.id not in seen_ids:
+                selected_questions.append(q)
+                seen_ids.add(q.id)
+        # Add by difficulty
+        for diff, n in zip(["Easy", "Medium", "Hard"], [n_easy, n_med, n_hard]):
+            pool = [q for q in orig_pool_by_diff[diff] if q.id not in seen_ids]
+            if len(pool) < n:
+                # Not enough, take all and fill with unknowns later
+                selected_questions.extend(pool)
+                seen_ids.update(q.id for q in pool)
+            else:
+                chosen = random.sample(pool, n)
+                selected_questions.extend(chosen)
+                seen_ids.update(q.id for q in chosen)
+        # Fill with unknowns if needed
+        if n_unknown > 0:
+            pool = [q for q in orig_pool_by_diff["Unknown"] if q.id not in seen_ids]
+            if len(pool) < n_unknown:
+                selected_questions.extend(pool)
+                seen_ids.update(q.id for q in pool)
+            else:
+                chosen = random.sample(pool, n_unknown)
+                selected_questions.extend(chosen)
+                seen_ids.update(q.id for q in chosen)
+        # If still not enough, fill with any available (should be rare)
+        while len(selected_questions) < n_total:
+            pool = [q for q in available_questions if q.id not in seen_ids]
+            if not pool:
+                break
+            q = random.choice(pool)
+            selected_questions.append(q)
+            seen_ids.add(q.id)
+        # If still not enough, allow duplicates (should be extremely rare)
+        while len(selected_questions) < n_total:
+            if available_questions:
+                selected_questions.append(random.choice(available_questions))
+            elif mandatory_questions:
+                selected_questions.append(random.choice(mandatory_questions))
+            else:
+                break
+        # Final deduplication (shouldn't be needed, but for safety)
+        unique_questions = []
+        seen_ids = set()
+        for q in selected_questions:
+            if q.id not in seen_ids:
+                unique_questions.append(q)
+                seen_ids.add(q.id)
+        # If not enough unique, fill with any
+        while len(unique_questions) < n_total:
+            pool = [q for q in available_questions if q.id not in seen_ids]
+            if not pool:
+                break
+            q = random.choice(pool)
+            unique_questions.append(q)
+            seen_ids.add(q.id)
+        # Now, use this exact set for all variants, shuffling order for each
+        for i in range(num_variants):
+            version_label = chr(65 + i)
+            variant = Variant.objects.create(exam=exam, version_label=version_label)
+            questions_for_variant = unique_questions.copy()
+            random.shuffle(questions_for_variant)
+            for order, question in enumerate(questions_for_variant[:n_total]):
+                VariantQuestion.objects.create(
+                    variant=variant, question=question, order=order
+                )
+            variants.append(variant)
+        # Distribution info for frontend
+        distribution_info = {
+            "per_variant": {
+                "Easy": n_easy,
+                "Medium": n_med,
+                "Hard": n_hard,
+                "Unknown": n_unknown,
+            },
+            "auto_balance_disabled": False,
+        }
+        return variants, distribution_info
+
+    @staticmethod
+    def _generate_section_based_variants(
+        exam: Exam,
+        mandatory_questions: List[Question],
+        section_questions: Dict,
+        section_allocation: Dict,
+        num_variants: int,
+        num_non_mandatory: int,
+        reuse_mode: bool = False,
+    ) -> Tuple[List[Variant], Optional[str], dict]:
+        """
+        Generate variants with section-based question allocation.
+        Questions are distributed proportionally across sections based on
+        the instructor's selections in Step 2.
+        """
+        from django.core.exceptions import ValidationError
+        
+        variants = []
+        used_question_ids = set()  # Track used questions for uniqueness
+        
+        # Validate we have enough questions per section
+        for section_id, allocation in section_allocation.items():
+            section_data = section_questions.get(section_id)
+            if not section_data:
+                continue
+                
+            available_in_section = len(section_data['questions'])
+            required_for_all_variants = allocation * num_variants if not reuse_mode else allocation
+            
+            if available_in_section < required_for_all_variants:
+                error_msg = (
+                    f"Not enough unique questions available in Section {section_data['section'].title} "
+                    f"to support {num_variants} variants with {allocation} questions each. "
+                    f"Available: {available_in_section}, Required: {required_for_all_variants}"
+                )
+                return None, error_msg, {}
+        
+        # Generate variants
+        for variant_index in range(num_variants):
+            version_label = chr(65 + variant_index)
+            variant = Variant.objects.create(exam=exam, version_label=version_label)
+            
+            # Start with mandatory questions
+            variant_questions = mandatory_questions.copy()
+            
+            # Add section-based questions
+            for section_id, allocation in section_allocation.items():
+                section_data = section_questions.get(section_id)
+                if not section_data:
+                    continue
+                    
+                section_questions_pool = section_data['questions']
+                
+                if reuse_mode:
+                    # In reuse mode, we can use the same questions across variants
+                    selected_questions = random.sample(section_questions_pool, min(allocation, len(section_questions_pool)))
+                else:
+                    # In unique mode, we need to avoid questions already used
+                    available_questions = [q for q in section_questions_pool if q.id not in used_question_ids]
+                    if len(available_questions) < allocation:
+                        # Not enough unique questions - this should have been caught in validation
+                        error_msg = f"Not enough unique questions in section {section_id}"
+                        return None, error_msg, {}
+                    
+                    selected_questions = random.sample(available_questions, allocation)
+                    used_question_ids.update(q.id for q in selected_questions)
+                
+                variant_questions.extend(selected_questions)
+            
+            # Shuffle the questions for this variant
+            random.shuffle(variant_questions)
+            
+            # Create VariantQuestion objects with section information
+            for order, question in enumerate(variant_questions):
+                # Find which section this question belongs to
+                question_section = None
+                for section_id, section_data in section_questions.items():
+                    if question in section_data['questions']:
+                        question_section = section_data['section']
+                        break
+                
+                VariantQuestion.objects.create(
+                    variant=variant, 
+                    question=question, 
+                    order=order,
+                    section=question_section
+                )
+            
+            variants.append(variant)
+        
+        # Calculate distribution info for analytics
+        distribution_info = {
+            "per_variant": {
+                "Easy": 0,
+                "Medium": 0,
+                "Hard": 0,
+                "Unknown": 0,
+            },
+            "auto_balance_disabled": False,
+            "section_allocation": section_allocation,
+        }
+        
+        return variants, None, distribution_info
+
+    @staticmethod
+    def _generate_unique_variants(
+        exam: Exam,
+        mandatory_questions: List[Question],
+        available_questions: List[Question],
+        num_variants: int,
+        num_non_mandatory: int,
+    ) -> Tuple[List[Variant], Optional[str], dict]:
+        """
+        Generate variants with unique questions only, strictly enforcing
+        difficulty distribution after mandatory questions.
+        Returns (variants, warning, distribution_info)
+        """
+
+        from django.core.exceptions import ValidationError
+
+        variants = []
+        # Precompute original difficulty pools
+        orig_pool_by_diff = {"Easy": [], "Medium": [], "Hard": [], "Unknown": []}
+        for q in available_questions:
+            if q.difficulty == 1:
+                orig_pool_by_diff["Easy"].append(q)
+            elif q.difficulty == 2:
+                orig_pool_by_diff["Medium"].append(q)
+            elif q.difficulty == 3:
+                orig_pool_by_diff["Hard"].append(q)
+            else:
+                orig_pool_by_diff["Unknown"].append(q)
+        # Precompute mandatory by difficulty
+        mandatory_by_diff = {"Easy": [], "Medium": [], "Hard": [], "Unknown": []}
+        for q in mandatory_questions:
+            if q.difficulty == 1:
+                mandatory_by_diff["Easy"].append(q)
+            elif q.difficulty == 2:
+                mandatory_by_diff["Medium"].append(q)
+            elif q.difficulty == 3:
+                mandatory_by_diff["Hard"].append(q)
+            else:
+                mandatory_by_diff["Unknown"].append(q)
+        easy_pct = int(exam.easy_percentage)
+        med_pct = int(exam.medium_percentage)
+        hard_pct = int(exam.hard_percentage)
+        n_total = exam.questions_per_variant
+        mand_easy = len(mandatory_by_diff["Easy"])
+        mand_med = len(mandatory_by_diff["Medium"])
+        mand_hard = len(mandatory_by_diff["Hard"])
+        mand_unknown = len(mandatory_by_diff["Unknown"])
+        n_easy = max(0, round((easy_pct / 100) * n_total) - mand_easy)
+        n_med = max(0, round((med_pct / 100) * n_total) - mand_med)
+        n_hard = max(0, round((hard_pct / 100) * n_total) - mand_hard)
+        n_unknown = max(
+            0,
+            n_total
+            - (mand_easy + mand_med + mand_hard + mand_unknown)
+            - n_easy
+            - n_med
+            - n_hard,
+        )
+        # Only non-mandatory counts should be adjusted
+        non_mandatory_counts = [
+            ("Easy", n_easy),
+            ("Medium", n_med),
+            ("Hard", n_hard),
+            ("Unknown", n_unknown),
+        ]
+        # Check if each difficulty can be distributed fairly
+        auto_balance_disabled = False
+        fair_counts = {}
+        for diff, count in non_mandatory_counts:
+            if diff == "Unknown":
+                continue
+            if count > 0:
+                if len(orig_pool_by_diff[diff]) < count * num_variants:
+                    # Not enough to distribute fairly, fill with as many as possible,
+                    # rest with Unknown
+                    fair_counts[diff] = len(orig_pool_by_diff[diff]) // num_variants
+                    auto_balance_disabled = True
+                else:
+                    fair_counts[diff] = count
+            else:
+                fair_counts[diff] = 0
+        # Recalculate unknowns to fill remaining slots
+        used_per_variant = (
+            sum(fair_counts.values()) + mand_easy + mand_med + mand_hard + mand_unknown
+        )
+        fair_counts["Unknown"] = max(0, n_total - used_per_variant)
+        # Compose final distribution info for frontend
+        distribution_info = {
+            "per_variant": fair_counts.copy(),
+            "auto_balance_disabled": auto_balance_disabled,
+        }
+        # Build variants
+        used_ids = set()
+        # --- FIX: Only require enough unique non-mandatory questions ---
+        total_unique_needed = num_variants * (n_total - len(mandatory_questions))
+        if len(available_questions) < total_unique_needed:
+            raise ValidationError(
+                f"Not enough unique non-mandatory questions to fill all variants: "
+                f"needed {total_unique_needed}, got {len(available_questions)}. "
+                "Please add more questions or reduce the number"
+                "of variants/questions per variant."
+            )
+        # Prepare pools for each difficulty
+        pools = {k: v.copy() for k, v in orig_pool_by_diff.items()}
+        for i in range(num_variants):
+            version_label = chr(65 + i)
+            variant = Variant.objects.create(exam=exam, version_label=version_label)
+            variant_questions = []
+            # Add all mandatory questions
+            variant_questions.extend(mandatory_questions)
+            # For each difficulty, add as many as possible up to fair_counts[diff]
+            for diff in ["Easy", "Medium", "Hard", "Unknown"]:
+                n = fair_counts[diff]
+                for _ in range(n):
+                    if pools[diff]:
+                        q = pools[diff].pop()
+                        if q.id not in used_ids:
+                            variant_questions.append(q)
+                            used_ids.add(q.id)
+            # If still not enough, fill with any remaining available unique questions
+            while len(variant_questions) < n_total and available_questions:
+                q = available_questions.pop()
+                if q.id not in used_ids:
+                    variant_questions.append(q)
+                    used_ids.add(q.id)
+            if len(variant_questions) < n_total:
+                raise ValidationError(
+                    (
+                        f"Not enough unique questions to fill variant {version_label}: "
+                        f"needed {n_total}, got {len(variant_questions)}. "
+                        f"Please add more questions or reduce the number"
+                        f"of variants/questions per variant."
+                    )
+                )
+            random.shuffle(variant_questions)
+            for order, question in enumerate(variant_questions):
+                VariantQuestion.objects.create(
+                    variant=variant, question=question, order=order
+                )
+            variants.append(variant)
+        return variants, None, distribution_info
+
+    @staticmethod
+    def _randomize_choices(variants: List[Variant]) -> None:
+        """
+        Algorithmically randomize answer choices for all variants
+        (round-robin by variant index).
+        Ensures all options are present and correct answer
+        index matches the new order for every variant.
+        Handles multi-correct answers by deduplicating and sorting.
+        """
+        from collections import defaultdict
+
+        question_to_vqs = defaultdict(list)
+        for variant in variants:
+            for vq in getattr(variant, "variantquestion_set").all():
+                question_to_vqs[vq.question.id].append(vq)
+        for vq_group in question_to_vqs.values():
+            vq0 = vq_group[0]
+            question = vq0.question
+            choices = question.choices
+            correct_answers = question.correct_answer
+            if isinstance(choices, dict):
+                original_choices = list(choices.values())
+                choice_keys = list(choices.keys())
+            elif isinstance(choices, list):
+                original_choices = choices.copy()
+                choice_keys = [chr(65 + i) for i in range(len(choices))]
+            else:
+                continue
+            round_robin_shuffle_choices(
+                vq_group, original_choices, correct_answers, choice_keys
+            )
+
+    @staticmethod
+    def _randomize_choices_fallback(vqs: List) -> None:
+        import random
+
+        for vq in vqs:
+            question = vq.question
+            choices = question.choices
+            correct_answers = question.correct_answer
+            if isinstance(choices, dict):
+                original_choices = list(choices.values())
+                choice_keys = list(choices.keys())
+            elif isinstance(choices, list):
+                original_choices = choices.copy()
+                choice_keys = [chr(65 + i) for i in range(len(choices))]
+            else:
+                continue
+            randomized = original_choices.copy()
+            random.shuffle(randomized)
+            new_correct = []
+            for correct_answer in correct_answers:
+                if isinstance(correct_answer, str):
+                    if isinstance(choices, dict) and correct_answer in choices:
+                        original_choice_value = choices[correct_answer]
+                        # Place correct answer at a random position
+                        if original_choice_value in randomized:
+                            randomized.remove(original_choice_value)
+                        insert_idx = random.randint(0, len(randomized))
+                        randomized.insert(insert_idx, original_choice_value)
+                        new_correct.append(insert_idx)
+                    elif isinstance(choices, list):
+                        idx = ord(correct_answer.upper()) - 65
+                        if 0 <= idx < len(choices):
+                            original_choice_value = choices[idx]
+                            if original_choice_value in randomized:
+                                randomized.remove(original_choice_value)
+                            insert_idx = random.randint(0, len(randomized))
+                            randomized.insert(insert_idx, original_choice_value)
+                            new_correct.append(insert_idx)
+                elif isinstance(correct_answer, int):
+                    if 0 <= correct_answer < len(original_choices):
+                        orig_value = original_choices[correct_answer]
+                        if orig_value in randomized:
+                            randomized.remove(orig_value)
+                        insert_idx = random.randint(0, len(randomized))
+                        randomized.insert(insert_idx, orig_value)
+                        new_correct.append(insert_idx)
+            # Always include all options for every variant
+            vq.randomized_choices = {
+                choice_keys[i]: randomized[i] for i in range(len(choice_keys))
+            }
+            vq.randomized_correct_answer = new_correct
+            vq.save()
+
+
+class ExamExportService:
+    """Service for exam export operations"""
+
+    @staticmethod
+    def generate_answer_key_csv(exam: Exam, variant_ids: Optional[List[int]] = None) -> str:
+        """Generate answer key as CSV - simplified format matching PDF/DOCX"""
+        # Get variants to export
+        variants = (
+            getattr(exam, "variants").filter(id__in=variant_ids)
+            if variant_ids
+            else getattr(exam, "variants").all()
+        )
+
+        # Create CSV content
+        csv_lines = []
+    
+        for variant in variants:
+            # Add variant header
+            csv_lines.append(f"Variant {variant.version_label}")
+            csv_lines.append("Question,Answer")
+        
+            # Get questions in order
+            variant_questions = (
+                getattr(variant, "variantquestion_set")
+                .select_related("question")
+                .order_by("order")
+            )
+
+            for i, vq in enumerate(variant_questions, 1):
+                question = vq.question
+
+                # Extract correct answers - use randomized data if available
+                correct_answers = []
+                if vq.randomized_correct_answer:
+                    # Use randomized data
+                    correct_answer_data = vq.randomized_correct_answer
+                    choices_data = vq.randomized_choices
+
+                    if isinstance(correct_answer_data, list):
+                        # Convert indices to choice letters
+                        if choices_data:
+                            choice_keys = list(choices_data.keys())
+                            for idx in correct_answer_data:
+                                if isinstance(idx, int) and idx < len(choice_keys):
+                                    correct_answers.append(choice_keys[idx])
+                                elif isinstance(idx, str):
+                                    correct_answers.append(idx)
+                    else:
+                        # Single correct answer
+                        if isinstance(correct_answer_data, int) and choices_data:
+                            choice_keys = list(choices_data.keys())
+                            if correct_answer_data < len(choice_keys):
+                                correct_answers.append(choice_keys[correct_answer_data])
+                        else:
+                            correct_answers.append(str(correct_answer_data))
+                else:
+                    # Use original data (fallback)
+                    if hasattr(question, "correct_answer"):
+                        if isinstance(question.correct_answer, list):
+                            # If it's a list of indices, convert to choice letters
+                            if question.choices:
+                                if isinstance(question.choices, dict):
+                                    # Choices are in dict format {A: text, B: text, ...}
+                                    choice_keys = list(question.choices.keys())
+                                    for idx in question.correct_answer:
+                                        if isinstance(idx, int) and idx < len(choice_keys):
+                                            correct_answers.append(choice_keys[idx])
+                                        elif isinstance(idx, str):
+                                            correct_answers.append(idx)
+                                else:
+                                    # Choices are in list format
+                                    for idx in question.correct_answer:
+                                        if isinstance(idx, int) and idx < len(question.choices):
+                                            correct_answers.append(chr(65 + idx))  # Convert to A, B, C, D
+                                        elif isinstance(idx, str):
+                                            correct_answers.append(idx)
+                        else:
+                            # Single correct answer
+                            if isinstance(question.correct_answer, int) and question.choices:
+                                if isinstance(question.choices, dict):
+                                    choice_keys = list(question.choices.keys())
+                                    if question.correct_answer < len(choice_keys):
+                                        correct_answers.append(choice_keys[question.correct_answer])
+                                else:
+                                    if question.correct_answer < len(question.choices):
+                                        correct_answers.append(chr(65 + question.correct_answer))
+                            else:
+                                correct_answers.append(str(question.correct_answer))
+
+                # Format correct answers
+                correct_answer_str = ", ".join(correct_answers) if correct_answers else "No answer"
+
+                # Add the simple row: question number, answer
+                csv_lines.append(f"{i},{correct_answer_str}")
+        
+            # Add blank line between variants (if multiple)
+            if len(variants) > 1:
+                csv_lines.append("")
+
+        return "\n".join(csv_lines)
+
+    @staticmethod
+    def create_export_history(
+        exam: Exam, user, export_format: str, variant_ids: Optional[List[int]] = None
+    ) -> ExamExportHistory:
+        """Create export history record"""
+        variants_exported = (
+            getattr(exam, "variants").filter(id__in=variant_ids)
+            if variant_ids
+            else getattr(exam, "variants").all()
+        )
+
+        export_history = ExamExportHistory.objects.create(
+            exam=exam, exported_by=user, export_format=export_format
+        )
+        export_history.variants_exported.set(variants_exported)
+
+        # Mark variants as exported
+        variants_exported.update(docx_exported=True, exported_at=timezone.now())
+
+        return export_history
+
+    @staticmethod
+    def generate_answer_key_pdf(exam: Exam, variant_ids: Optional[List[int]] = None) -> bytes:
+        """Generate answer key as PDF"""
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+        from io import BytesIO
+    
+        buffer = BytesIO()
+        c = canvas.Canvas(buffer, pagesize=letter)
+    
+        # Get variants to export
+        variants = (
+            exam.variants.filter(id__in=variant_ids)
+            if variant_ids
+            else exam.variants.all()
+        )
+    
+        y_position = 750
+        for variant in variants:
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(50, y_position, f"{exam.title} - Variant {variant.version_label} Answer Key")
+            y_position -= 30
+        
+            c.setFont("Helvetica", 12)
+            variant_questions = variant.variantquestion_set.select_related("question").order_by("order")
+        
+            for i, vq in enumerate(variant_questions, 1):
+                question = vq.question
+            
+                # Extract correct answers - SAME LOGIC AS CSV
+                correct_answers = []
+                if vq.randomized_correct_answer:
+                    # Use randomized data
+                    correct_answer_data = vq.randomized_correct_answer
+                    choices_data = vq.randomized_choices
+
+                    if isinstance(correct_answer_data, list):
+                        # Convert indices to choice letters
+                        if choices_data:
+                            choice_keys = list(choices_data.keys())
+                            for idx in correct_answer_data:
+                                if isinstance(idx, int) and idx < len(choice_keys):
+                                    correct_answers.append(choice_keys[idx])
+                                elif isinstance(idx, str):
+                                    correct_answers.append(idx)
+                    else:
+                        # Single correct answer
+                        if isinstance(correct_answer_data, int) and choices_data:
+                            choice_keys = list(choices_data.keys())
+                            if correct_answer_data < len(choice_keys):
+                                correct_answers.append(choice_keys[correct_answer_data])
+                        else:
+                            correct_answers.append(str(correct_answer_data))
+                else:
+                    # Use original data (fallback)
+                    if hasattr(question, "correct_answer"):
+                        if isinstance(question.correct_answer, list):
+                            # If it's a list of indices, convert to choice letters
+                            if question.choices:
+                                if isinstance(question.choices, dict):
+                                    # Choices are in dict format {A: text, B: text, ...}
+                                    choice_keys = list(question.choices.keys())
+                                    for idx in question.correct_answer:
+                                        if isinstance(idx, int) and idx < len(choice_keys):
+                                            correct_answers.append(choice_keys[idx])
+                                        elif isinstance(idx, str):
+                                            correct_answers.append(idx)
+                                else:
+                                    # Choices are in list format
+                                    for idx in question.correct_answer:
+                                        if isinstance(idx, int) and idx < len(question.choices):
+                                            correct_answers.append(chr(65 + idx))  # Convert to A, B, C, D
+                                        elif isinstance(idx, str):
+                                            correct_answers.append(idx)
+                        else:
+                            # Single correct answer
+                            if isinstance(question.correct_answer, int) and question.choices:
+                                if isinstance(question.choices, dict):
+                                    choice_keys = list(question.choices.keys())
+                                    if question.correct_answer < len(choice_keys):
+                                        correct_answers.append(choice_keys[question.correct_answer])
+                                else:
+                                    if question.correct_answer < len(question.choices):
+                                        correct_answers.append(chr(65 + question.correct_answer))
+                            else:
+                                correct_answers.append(str(question.correct_answer))
+            
+                # Format correct answers
+                correct_answer_str = ", ".join(correct_answers) if correct_answers else "No answer"
+            
+                c.drawString(50, y_position, f"{i}. {correct_answer_str}")
+                y_position -= 20
+            
+                if y_position < 50:
+                    c.showPage()
+                    y_position = 750
+        
+            c.showPage()
+    
+        c.save()
+        buffer.seek(0)
+        return buffer.read()
+
+    @staticmethod
+    def generate_answer_key_docx(exam: Exam, variant_ids: Optional[List[int]] = None) -> bytes:
+        """Generate answer key as DOCX"""
+        from docx import Document
+        from io import BytesIO
+    
+        doc = Document()
+    
+        # Get variants to export
+        variants = (
+            exam.variants.filter(id__in=variant_ids)
+            if variant_ids
+            else exam.variants.all()
+        )
+    
+        for variant in variants:
+            doc.add_heading(f"{exam.title} - Variant {variant.version_label} Answer Key", level=1)
+        
+            variant_questions = variant.variantquestion_set.select_related("question").order_by("order")
+        
+            for i, vq in enumerate(variant_questions, 1):
+                question = vq.question
+            
+                # Extract correct answers - SAME LOGIC AS CSV
+                correct_answers = []
+                if vq.randomized_correct_answer:
+                    # Use randomized data
+                    correct_answer_data = vq.randomized_correct_answer
+                    choices_data = vq.randomized_choices
+
+                    if isinstance(correct_answer_data, list):
+                        # Convert indices to choice letters
+                        if choices_data:
+                            choice_keys = list(choices_data.keys())
+                            for idx in correct_answer_data:
+                                if isinstance(idx, int) and idx < len(choice_keys):
+                                    correct_answers.append(choice_keys[idx])
+                                elif isinstance(idx, str):
+                                    correct_answers.append(idx)
+                    else:
+                        # Single correct answer
+                        if isinstance(correct_answer_data, int) and choices_data:
+                            choice_keys = list(choices_data.keys())
+                            if correct_answer_data < len(choice_keys):
+                                correct_answers.append(choice_keys[correct_answer_data])
+                        else:
+                            correct_answers.append(str(correct_answer_data))
+                else:
+                    # Use original data (fallback)
+                    if hasattr(question, "correct_answer"):
+                        if isinstance(question.correct_answer, list):
+                            # If it's a list of indices, convert to choice letters
+                            if question.choices:
+                                if isinstance(question.choices, dict):
+                                    # Choices are in dict format {A: text, B: text, ...}
+                                    choice_keys = list(question.choices.keys())
+                                    for idx in question.correct_answer:
+                                        if isinstance(idx, int) and idx < len(choice_keys):
+                                            correct_answers.append(choice_keys[idx])
+                                        elif isinstance(idx, str):
+                                            correct_answers.append(idx)
+                                else:
+                                    # Choices are in list format
+                                    for idx in question.correct_answer:
+                                        if isinstance(idx, int) and idx < len(question.choices):
+                                            correct_answers.append(chr(65 + idx))  # Convert to A, B, C, D
+                                        elif isinstance(idx, str):
+                                            correct_answers.append(idx)
+                        else:
+                            # Single correct answer
+                            if isinstance(question.correct_answer, int) and question.choices:
+                                if isinstance(question.choices, dict):
+                                    choice_keys = list(question.choices.keys())
+                                    if question.correct_answer < len(choice_keys):
+                                        correct_answers.append(choice_keys[question.correct_answer])
+                                else:
+                                    if question.correct_answer < len(question.choices):
+                                        correct_answers.append(chr(65 + question.correct_answer))
+                            else:
+                                correct_answers.append(str(question.correct_answer))
+            
+                # Format correct answers
+                correct_answer_str = ", ".join(correct_answers) if correct_answers else "No answer"
+            
+                doc.add_paragraph(f"{i}. {correct_answer_str}")
+        
+            doc.add_page_break()
+    
+        buffer = BytesIO()
+        doc.save(buffer)
+        return buffer.getvalue()
+    
+    @staticmethod
+    def generate_exam_csv(exam: Exam, variant_ids: Optional[List[int]] = None) -> str:
+        """Generate full exam as CSV"""
+        # Get variants to export
+        variants = (
+            exam.variants.filter(id__in=variant_ids)
+            if variant_ids
+            else exam.variants.all()
+        )
+        
+        # Create CSV content
+        csv_lines = ["Variant,Question Number,Question Text,Choice A,Choice B,Choice C,Choice D,Choice E,Points"]
+        
+        for variant in variants:
+            variant_questions = variant.variantquestion_set.select_related("question").order_by("order")
+            
+            for i, vq in enumerate(variant_questions, 1):
+                question = vq.question
+                
+                # Get choices
+                if vq.randomized_choices:
+                    choices = vq.randomized_choices
+                else:
+                    choices = question.choices
+                
+                # Format choices
+                choice_values = []
+                if isinstance(choices, dict):
+                    for key in ['A', 'B', 'C', 'D', 'E']:
+                        choice_values.append(choices.get(key, ''))
+                else:
+                    # Handle list format
+                    for j in range(5):
+                        if j < len(choices):
+                            choice_values.append(str(choices[j]))
+                        else:
+                            choice_values.append('')
+                
+                # Escape quotes in text
+                question_text = question.prompt.replace('"', '""')
+                choice_values = [v.replace('"', '""') for v in choice_values]
+                
+                row = [
+                    variant.version_label,
+                    str(i),
+                    f'"{question_text}"',
+                    f'"{choice_values[0]}"',
+                    f'"{choice_values[1]}"',
+                    f'"{choice_values[2]}"',
+                    f'"{choice_values[3]}"',
+                    f'"{choice_values[4]}"',
+                    str(question.points)
+                ]
+                
+                csv_lines.append(','.join(row))
+        
+        return '\n'.join(csv_lines)
+
+    @staticmethod
+    def export_variants_to_pdf_files(exam, variant_ids):
+        """Export variants to PDF format with UBC professional formatting"""
+        return PDFExporter.export_variants_to_pdf_files(exam, variant_ids)
+    
+        result_files = []
+        
+        # If variant_ids is None, export all variants
+        if variant_ids is None:
+            variant_ids = list(exam.variants.values_list('id', flat=True))
+    
+        for vid in variant_ids:
+            variant = exam.variants.get(id=vid)
+            buffer = BytesIO()
+            c = canvas.Canvas(buffer, pagesize=letter)
+        
+            # Set margins to 1 inch
+            margin = 1 * inch
+            page_width, page_height = letter
+            content_width = page_width - 2 * margin
+            content_height = page_height - 2 * margin
+        
+            # 1. UBC-STYLE HEADER AREA
+            y_position = page_height - margin - 50
+            
+            # Course code and title
+            if hasattr(exam, 'course') and exam.course:
+                c.setFont("Times-Bold", 14)
+                course_text = f"[{exam.course.code}] {exam.title}"
+                text_width = c.stringWidth(course_text, "Times-Bold", 14)
+                c.drawString((page_width - text_width) / 2, y_position, course_text)
+                y_position -= 30
+            
+            # Course title
+            if hasattr(exam, 'course') and exam.course:
+                c.setFont("Times-Roman", 12)
+                course_title_text = f"Course Title: {exam.course.name}"
+                text_width = c.stringWidth(course_title_text, "Times-Roman", 12)
+                c.drawString((page_width - text_width) / 2, y_position, course_title_text)
+                y_position -= 25
+        
+            # Date
+            exam_date = getattr(exam, 'available_from', None)
+            if not exam_date:
+                exam_date = getattr(exam, 'created_at', datetime.datetime.now())
+            if isinstance(exam_date, str):
+                exam_date = datetime.datetime.fromisoformat(exam_date.replace('Z', '+00:00'))
+            date_text = f"Date: {exam_date.strftime('%B %Y')}"
+            text_width = c.stringWidth(date_text, "Times-Roman", 12)
+            c.drawString((page_width - text_width) / 2, y_position, date_text)
+            y_position -= 30
+            
+            # Variant label
+            variant_text = f"Variant {variant.version_label}"
+            c.setFont("Times-Bold", 14)
+            text_width = c.stringWidth(variant_text, "Times-Bold", 14)
+            c.drawString((page_width - text_width) / 2, y_position, variant_text)
+            y_position -= 60
+        
+            # 2. STUDENT INFO SECTION
+            # Name and Student ID
+            c.setFont("Times-Bold", 12)
+            c.drawString(margin, y_position, "Name:")
+            c.drawString(margin + 200, y_position, "Student ID:")
+            y_position -= 20
+            
+            c.setFont("Times-Roman", 12)
+            c.drawString(margin + 50, y_position, "_____________________________")
+            c.drawString(margin + 250, y_position, "_____________________________")
+            y_position -= 30
+            
+            # Signature
+            c.setFont("Times-Bold", 12)
+            c.drawString(margin, y_position, "Signature:")
+            c.setFont("Times-Roman", 12)
+            c.drawString(margin + 80, y_position, "____________________________")
+            y_position -= 50
+        
+            # 3. INSTRUCTIONS BLOCK (only if exam_instructions is not empty)
+            if hasattr(exam, 'exam_instructions') and exam.exam_instructions.strip():
+                c.setFont("Times-Roman", 12)
+                instruction_lines = textwrap.wrap(exam.exam_instructions, width=70)
+                for line in instruction_lines:
+                    c.drawString(margin + 20, y_position, line)
+                    y_position -= 18
+                y_position -= 10
+            
+            # Time and marks info (only if both are set and non-zero)
+            time_limit = getattr(exam, 'time_limit', 0)
+            total_points = getattr(exam, 'total_points', 0)
+            
+            if time_limit and total_points and time_limit > 0 and total_points > 0:
+                c.setFont("Times-Roman", 12)
+                time_marks_text = f"• You have {time_limit} minutes to write this exam. A total of {total_points} marks are available."
+                time_marks_lines = textwrap.wrap(time_marks_text, width=70)
+                for line in time_marks_lines:
+                    c.drawString(margin + 20, y_position, line)
+                    y_position -= 18
+                y_position -= 10
+        
+            # 4. ACADEMIC INTEGRITY STATEMENT
+            if hasattr(exam, 'include_academic_integrity') and exam.include_academic_integrity:
+                y_position -= 20
+                c.setFont("Times-Bold", 12)
+                c.drawString(margin, y_position, "Academic Integrity Statement:")
+                y_position -= 25
+                
+                c.setFont("Times-Roman", 12)
+                # Use custom statement if provided, otherwise use default
+                custom_statement = getattr(exam, 'academic_integrity_statement', '')
+                if custom_statement and custom_statement.strip():
+                    statement = custom_statement
+                else:
+                    statement = 'I confirm that I will not give or receive unauthorized aid on this examination. I understand that academic dishonesty includes, but is not limited to, cheating, plagiarism, and the unauthorized use of materials or devices.'
+                
+                statement_lines = textwrap.wrap(statement, width=70)
+                for line in statement_lines:
+                    c.drawString(margin + 20, y_position, line)
+                    y_position -= 18
+                y_position -= 20
+        
+            # 5. QUESTIONS SECTION
+            variant_questions = variant.variantquestion_set.select_related('question', 'section').order_by('order')
+            
+            # Group questions by section if sections exist
+            if hasattr(exam, 'sections') and exam.sections.exists():
+                # Group questions by section using the stored section information
+                questions_by_section = {}
+                questions_without_section = []
+                
+                for vq in variant_questions:
+                    section = vq.section
+                    if section:
+                        if section.id not in questions_by_section:
+                            questions_by_section[section.id] = {
+                                'section': section,
+                                'questions': []
+                            }
+                        questions_by_section[section.id]['questions'].append(vq)
+                    else:
+                        # Questions without sections go to a separate list
+                        questions_without_section.append(vq)
+                
+                # Sort sections by order and render questions
+                current_section = None
+                question_number = 1
+                
+                for section_id in sorted(questions_by_section.keys(), 
+                                       key=lambda x: questions_by_section[x]['section'].order):
+                    section_data = questions_by_section[section_id]
+                    section = section_data['section']
+                    
+                    # Check if we need a new page for section header
+                    if y_position < margin + 150:
+                        c.showPage()
+                        y_position = page_height - margin - 50
+                    
+                    # Section header
+                    c.setFont("Times-Bold", 14)
+                    section_text = f"Section {section.title} — Multiple Choice"
+                    c.drawString(margin, y_position, section_text)
+                    y_position -= 25
+                    
+                    # Section instructions if provided
+                    if section.instructions:
+                        c.setFont("Times-Roman", 12)
+                        section_lines = textwrap.wrap(section.instructions, width=70)
+                        for line in section_lines:
+                            c.drawString(margin + 20, y_position, line)
+                            y_position -= 18
+                        y_position -= 10
+                    
+                    # Questions in this section
+                    for vq in section_data['questions']:
+                        question = vq.question
+                        
+                        # Check if we need a new page
+                        if y_position < margin + 100:
+                            c.showPage()
+                            y_position = page_height - margin - 50
+                        
+                        # Add question with marks
+                        points = getattr(question, 'points', 1)
+                        c.setFont("Times-Bold", 12)
+                        question_text = f"{question_number}. {question.prompt} [{points} mark{'s' if points != 1 else ''}]"
+                        question_lines = textwrap.wrap(question_text, width=70)
+                        for line in question_lines:
+                            c.drawString(margin, y_position, line)
+                            y_position -= 20
+                        
+                        # Get choices - use randomized if available
+                        if vq.randomized_choices:
+                            choices = vq.randomized_choices
+                        else:
+                            choices = question.choices
+                        
+                        # Draw choices with proper indentation
+                        c.setFont("Times-Roman", 12)
+                        if isinstance(choices, dict):
+                            for label, text in choices.items():
+                                choice_text = f"{label}. {text}"
+                                choice_lines = textwrap.wrap(choice_text, width=65)
+                                for line in choice_lines:
+                                    c.drawString(margin + 20, y_position, line)
+                                    y_position -= 18
+                        
+                        # Space between questions
+                        y_position -= 15
+                        question_number += 1
+                
+                # Handle questions without sections
+                if questions_without_section:
+                    # Check if we need a new page
+                    if y_position < margin + 150:
+                        c.showPage()
+                        y_position = page_height - margin - 50
+                    
+                    # Section header for questions without sections
+                    c.setFont("Times-Bold", 14)
+                    section_text = "Additional Questions — Multiple Choice"
+                    c.drawString(margin, y_position, section_text)
+                    y_position -= 25
+                    
+                    for vq in questions_without_section:
+                        question = vq.question
+                        
+                        # Check if we need a new page
+                        if y_position < margin + 100:
+                            c.showPage()
+                            y_position = page_height - margin - 50
+                        
+                        # Add question with marks
+                        points = getattr(question, 'points', 1)
+                        c.setFont("Times-Bold", 12)
+                        question_text = f"{question_number}. {question.prompt} [{points} mark{'s' if points != 1 else ''}]"
+                        question_lines = textwrap.wrap(question_text, width=70)
+                        for line in question_lines:
+                            c.drawString(margin, y_position, line)
+                            y_position -= 20
+                        
+                        # Get choices - use randomized if available
+                        if vq.randomized_choices:
+                            choices = vq.randomized_choices
+                        else:
+                            choices = question.choices
+                        
+                        # Draw choices with proper indentation
+                        c.setFont("Times-Roman", 12)
+                        if isinstance(choices, dict):
+                            for label, text in choices.items():
+                                choice_text = f"{label}. {text}"
+                                choice_lines = textwrap.wrap(choice_text, width=65)
+                                for line in choice_lines:
+                                    c.drawString(margin + 20, y_position, line)
+                                    y_position -= 18
+                        
+                        # Space between questions
+                        y_position -= 15
+                        question_number += 1
+            else:
+                # No sections - just add questions sequentially
+            for idx, vq in enumerate(variant_questions, start=1):
+                question = vq.question
+                    points = getattr(question, 'points', 1)
+            
+                # Check if we need a new page
+                    if y_position < margin + 100:
+                    c.showPage()
+                        y_position = page_height - margin - 50
+                    
+                    # Question prompt with marks
+                    c.setFont("Times-Bold", 12)
+                    question_text = f"{idx}. {question.prompt} [{points} mark{'s' if points != 1 else ''}]"
+                    question_lines = textwrap.wrap(question_text, width=70)
+                    for line in question_lines:
+                        c.drawString(margin, y_position, line)
+                    y_position -= 20
+            
+                # Get choices - use randomized if available
+                if vq.randomized_choices:
+                    choices = vq.randomized_choices
+                else:
+                    choices = question.choices
+            
+                    # Draw choices with proper indentation
+                    c.setFont("Times-Roman", 12)
+                if isinstance(choices, dict):
+                    for label, text in choices.items():
+                            choice_text = f"{label}. {text}"
+                            choice_lines = textwrap.wrap(choice_text, width=65)
+                        for line in choice_lines:
+                                c.drawString(margin + 20, y_position, line)
+                            y_position -= 18
+            
+                # Space between questions
+                    y_position -= 15
+        
+            # 6. FOOTER (if provided)
+            if hasattr(exam, 'footer_text') and exam.footer_text:
+                # Add a page break to ensure footer is on a new page
+                doc.add_page_break()
+                footer_para = doc.add_paragraph(exam.footer_text)
+                footer_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                footer_para.runs[0].font.italic = True
+                footer_para.runs[0].font.size = Pt(10)
+                footer_para.runs[0].font.name = 'Times New Roman'
+        
+            # Save to buffer
+            buffer = BytesIO()
+            doc.save(buffer)
+        
+            filename = f"{exam.title}_Variant_{variant.version_label}.docx"
+            result_files.append((filename, buffer.getvalue()))
+    
+        return result_files
+
+    @staticmethod
+    def export_variants_to_docx_files(exam, variant_ids):
+        """Export variants to DOCX format with UBC professional formatting"""
+        return DOCXExporter.export_variants_to_docx_files(exam, variant_ids)
+            
+            # Signature
+            doc.add_paragraph()
+            sig_para = doc.add_paragraph("Signature: ____________________________")
+            sig_para.runs[0].font.bold = True
+            
+            doc.add_paragraph()
+            doc.add_paragraph()
+        
+            # 3. INSTRUCTIONS BLOCK (only if exam_instructions is not empty)
+            if hasattr(exam, 'exam_instructions') and exam.exam_instructions.strip():
+                instructions_para = doc.add_paragraph()
+                instructions_para.style = 'Normal'
+                
+                instructions_run = instructions_para.add_run(exam.exam_instructions)
+                instructions_run.font.name = 'Times New Roman'
+                instructions_run.font.size = Pt(12)
+                
+                doc.add_paragraph()
+            
+            # Time and marks info (only if both are set and non-zero)
+            time_limit = getattr(exam, 'time_limit', 0)
+            total_points = getattr(exam, 'total_points', 0)
+            
+            if time_limit and total_points and time_limit > 0 and total_points > 0:
+                time_marks_para = doc.add_paragraph()
+                time_marks_text = f"• You have {time_limit} minutes to write this exam. A total of {total_points} marks are available."
+                time_marks_run = time_marks_para.add_run(time_marks_text)
+                time_marks_run.font.name = 'Times New Roman'
+                time_marks_run.font.size = Pt(12)
+                
+                doc.add_paragraph()
+        
+            # 4. ACADEMIC INTEGRITY STATEMENT
+            if hasattr(exam, 'include_academic_integrity') and exam.include_academic_integrity:
+                integrity_para = doc.add_paragraph()
+                integrity_run = integrity_para.add_run("Academic Integrity Statement:")
+                integrity_run.font.bold = True
+                integrity_run.font.size = Pt(12)
+                integrity_run.font.name = 'Times New Roman'
+                
+                doc.add_paragraph()
+                
+                # Use custom statement if provided, otherwise use default
+                custom_statement = getattr(exam, 'academic_integrity_statement', '')
+                if custom_statement and custom_statement.strip():
+                    statement = custom_statement
+                else:
+                    statement = 'I confirm that I will not give or receive unauthorized aid on this examination. I understand that academic dishonesty includes, but is not limited to, cheating, plagiarism, and the unauthorized use of materials or devices.'
+                
+                statement_para = doc.add_paragraph(statement)
+                statement_para.runs[0].font.name = 'Times New Roman'
+                statement_para.runs[0].font.size = Pt(12)
+                
+                doc.add_paragraph()
+        
+            # 5. QUESTIONS SECTION
+            variant_questions = variant.variantquestion_set.select_related('question', 'section').order_by('order')
+            
+            # Group questions by section if sections exist
+            if hasattr(exam, 'sections') and exam.sections.exists():
+                # Group questions by section using the stored section information
+                questions_by_section = {}
+                questions_without_section = []
+                
+                for vq in variant_questions:
+                    section = vq.section
+                    if section:
+                        if section.id not in questions_by_section:
+                            questions_by_section[section.id] = {
+                                'section': section,
+                                'questions': []
+                            }
+                        questions_by_section[section.id]['questions'].append(vq)
+                    else:
+                        # Questions without sections go to a separate list
+                        questions_without_section.append(vq)
+                
+                # Sort sections by order and render questions
+                current_section = None
+                question_number = 1
+                
+                for section_id in sorted(questions_by_section.keys(), 
+                                       key=lambda x: questions_by_section[x]['section'].order):
+                    section_data = questions_by_section[section_id]
+                    section = section_data['section']
+                    
+                    # Check if we need a new page for section header
+                    if y_position < margin + 150:
+                        c.showPage()
+                        y_position = page_height - margin - 50
+                    
+                    # Section header
+                    c.setFont("Times-Bold", 14)
+                    section_text = f"Section {section.title} — Multiple Choice"
+                    c.drawString(margin, y_position, section_text)
+                    y_position -= 25
+                    
+                    # Section instructions if provided
+                    if section.instructions:
+                        c.setFont("Times-Roman", 12)
+                        section_lines = textwrap.wrap(section.instructions, width=70)
+                        for line in section_lines:
+                            c.drawString(margin + 20, y_position, line)
+                            y_position -= 18
+                        y_position -= 10
+                    
+                    # Questions in this section
+                    for vq in section_data['questions']:
+                question = vq.question
+            
+                        # Add question with marks
+                        points = getattr(question, 'points', 1)
+                q_para = doc.add_paragraph()
+                        q_run = q_para.add_run(f"{question_number}. {question.prompt} [{points} mark{'s' if points != 1 else ''}]")
+                        q_run.font.bold = True
+                        q_run.font.size = Pt(12)
+                        q_run.font.name = 'Times New Roman'
+            
+                # Get choices - use randomized if available
+                if vq.randomized_choices:
+                    choices = vq.randomized_choices
+                else:
+                    choices = question.choices
+            
+                        # Add choices with proper indentation
+                if isinstance(choices, dict):
+                    for label, text in choices.items():
+                        c_para = doc.add_paragraph(f"{label}. {text}")
+                                c_para.paragraph_format.left_indent = Inches(0.5)
+                                c_para.runs[0].font.name = 'Times New Roman'
+                                c_para.runs[0].font.size = Pt(12)
+            
+                # Space between questions
+                doc.add_paragraph()
+                        question_number += 1
+                
+                # Handle questions without sections
+                if questions_without_section:
+                    # Check if we need a new page
+                    if y_position < margin + 150:
+                        c.showPage()
+                        y_position = page_height - margin - 50
+                    
+                    # Section header for questions without sections
+                    c.setFont("Times-Bold", 14)
+                    section_text = "Additional Questions — Multiple Choice"
+                    c.drawString(margin, y_position, section_text)
+                    y_position -= 25
+                    
+                    for vq in questions_without_section:
+                        question = vq.question
+                        
+                        # Check if we need a new page
+                        if y_position < margin + 100:
+                            c.showPage()
+                            y_position = page_height - margin - 50
+                        
+                        # Add question with marks
+                        points = getattr(question, 'points', 1)
+                        c.setFont("Times-Bold", 12)
+                        question_text = f"{question_number}. {question.prompt} [{points} mark{'s' if points != 1 else ''}]"
+                        question_lines = textwrap.wrap(question_text, width=70)
+                        for line in question_lines:
+                            c.drawString(margin, y_position, line)
+                            y_position -= 20
+                        
+                        # Get choices - use randomized if available
+                        if vq.randomized_choices:
+                            choices = vq.randomized_choices
+                        else:
+                            choices = question.choices
+                        
+                        # Draw choices with proper indentation
+                        c.setFont("Times-Roman", 12)
+                        if isinstance(choices, dict):
+                            for label, text in choices.items():
+                                choice_text = f"{label}. {text}"
+                                choice_lines = textwrap.wrap(choice_text, width=65)
+                                for line in choice_lines:
+                                    c.drawString(margin + 20, y_position, line)
+                                    y_position -= 18
+                        
+                        # Space between questions
+                        y_position -= 15
+                        question_number += 1
+            else:
+                # No sections - just add questions sequentially
+                for idx, vq in enumerate(variant_questions, start=1):
+                    question = vq.question
+                    points = getattr(question, 'points', 1)
+                
+                    # Question prompt with marks
+                    q_para = doc.add_paragraph()
+                    q_run = q_para.add_run(f"{idx}. {question.prompt} [{points} mark{'s' if points != 1 else ''}]")
+                    q_run.font.bold = True
+                    q_run.font.size = Pt(12)
+                    q_run.font.name = 'Times New Roman'
+            
+                # Get choices - use randomized if available
+                if vq.randomized_choices:
+                    choices = vq.randomized_choices
+                else:
+                    choices = question.choices
+            
+                    # Add choices with proper indentation
+                if isinstance(choices, dict):
+                    for label, text in choices.items():
+                        c_para = doc.add_paragraph(f"{label}. {text}")
+                        c_para.paragraph_format.left_indent = Inches(0.5)
+                        c_para.runs[0].font.name = 'Times New Roman'
+                        c_para.runs[0].font.size = Pt(12)
+                # Space between questions
+                doc.add_paragraph()
+        
+            # 6. FOOTER (if provided)
+            if hasattr(exam, 'footer_text') and exam.footer_text:
+                # Add a page break to ensure footer is on a new page
+                doc.add_page_break()
+                footer_para = doc.add_paragraph(exam.footer_text)
+                footer_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                footer_para.runs[0].font.italic = True
+                footer_para.runs[0].font.size = Pt(10)
+                footer_para.runs[0].font.name = 'Times New Roman'
+        
+            # Save to buffer
+            buffer = BytesIO()
+            doc.save(buffer)
+        
+            filename = f"{exam.title}_Variant_{variant.version_label}.docx"
+            result_files.append((filename, buffer.getvalue()))
+    
+        return result_files
+
+    @staticmethod
+    def export_variants_to_zip(exam, variant_ids, format_type):
+        """
+        Export multiple variants to a ZIP file.
+        format_type can be 'pdf' or 'docx'
+        """
+        import zipfile
+        from io import BytesIO
+    
+        buffer = BytesIO()
+    
+        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            if format_type == 'pdf':
+                files = ExamExportService.export_variants_to_pdf_files(exam, variant_ids)
+            else:  # docx
+                files = ExamExportService.export_variants_to_docx_files(exam, variant_ids)
+        
+            for filename, file_content in files:
+                zf.writestr(filename, file_content)
+    
+        buffer.seek(0)
+        return buffer.getvalue()
+
+
+    @staticmethod
+    def export_answer_keys_to_zip(exam, variant_ids):
+        """
+        Export answer keys for multiple variants to a ZIP file.
+        """
+        import zipfile
+        from io import BytesIO
+    
+        buffer = BytesIO()
+        
+        # If variant_ids is None, export all variants
+        if variant_ids is None:
+            variant_ids = list(exam.variants.values_list('id', flat=True))
+    
+        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for variant_id in variant_ids:
+                variant = exam.variants.get(id=variant_id)
+                
+                # Generate answer key content
+                content = ExamExportService.generate_answer_key_csv(exam, [variant_id])
+                filename = f"{exam.title}_Variant_{variant.version_label}_AnswerKey.csv"
+                zf.writestr(filename, content.encode('utf-8'))
+    
+        buffer.seek(0)
+        return buffer.getvalue()
+    
+
+    @staticmethod
+    def export_variants_to_docx(exam, variant_ids):
+        """
+        Build a .docx containing all specified variants with their questions and choices.
+        This returns the raw bytes for a single DOCX file containing all variants.
+        """
+        from docx import Document
+        from docx.shared import Inches
+        from io import BytesIO
+    
+        doc = Document()
+
+        for vid in variant_ids:
+            variant = exam.variants.get(id=vid)
+
+            # Heading: Exam Title — Variant X
+            doc.add_heading(f"{exam.title} — Variant {variant.version_label}", level=1)
+
+            # Get variant questions in order
+            variant_questions = variant.variantquestion_set.select_related('question').order_by('order')
+
+            # Questions
+            for idx, vq in enumerate(variant_questions, start=1):
+                question = vq.question
+            
+                # Question prompt, bold
+                q_para = doc.add_paragraph()
+                run = q_para.add_run(f"{idx}. {question.prompt}")
+                run.bold = True
+
+                # Get choices - use randomized if available
+                if vq.randomized_choices:
+                    choices = vq.randomized_choices
+                else:
+                    choices = getattr(question, 'choices', {})
+            
+                # Choices
+                if isinstance(choices, dict):
+                    for label, text in choices.items():
+                        c_para = doc.add_paragraph(f"{label}. {text}")
+                        # indent choices
+                        c_para.paragraph_format.left_indent = Inches(0.25)
+
+            # Page break between variants (last one will leave an extra blank page, which is fine)
+            doc.add_page_break()
+
+        # Serialize to bytes
+        buffer = BytesIO()
+        doc.save(buffer)
+        return buffer.getvalue()
+
+class ExamUpdateService:
+    """Service for updating exam settings"""
+
+    @staticmethod
+    def update_exam_settings(exam: Exam, settings: Dict[str, Any]) -> Exam:
+        """Update exam settings with validation"""
+        # Validate settings before updating
+        for field, value in settings.items():
+            if hasattr(exam, field):
+                setattr(exam, field, value)
+
+        # Validate the updated exam
+        errors = ExamValidationService.validate_exam_config(exam)
+        if errors:
+            raise ValidationError("; ".join(errors))
+
+        exam.save()
+        return exam
+
+    @staticmethod
+    def update_mandatory_questions(exam: Exam, question_ids: List[int]) -> None:
+        """Update mandatory questions for an exam"""
+        exam.mandatory_questions.set(question_ids)
+
+    @staticmethod
+    def update_variant_order(
+        exam: Exam, variant_id: int, question_orders: Dict[str, int]
+    ) -> None:
+        """Update the order of questions in a variant, ignoring missing questions."""
+        from .models import Variant, VariantQuestion
+
+        variant = Variant.objects.get(id=variant_id, exam=exam)
+        # Only update order for questions that still exist in the variant
+        for question_id, order in question_orders.items():
+            try:
+                vq = VariantQuestion.objects.get(
+                    variant=variant, question_id=question_id
+                )
+                vq.order = order
+                vq.save()
+            except VariantQuestion.DoesNotExist:
+                # Ignore missing questions (e.g., just deleted)
+                continue

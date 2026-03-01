@@ -1,0 +1,23 @@
+# Ignore secrets
+.env
+
+# Python-related
+__pycache__/
+*.pyc
+.venv/
+app/backend/.venv
+.dockerignore
+
+# Node modules (if mistakenly added in root)
+node_modules/
+
+
+# ---------- Global Logging (runtime log files) ----------
+# only useful for each runtime session for troubleshooting/debugging
+global_app_logs/        
+
+# Coverage Testing
+.coverage
+htmlcov/
+coverage.xml
+/app/backend/exports

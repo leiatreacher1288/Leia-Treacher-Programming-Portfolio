@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.sidebar-container {
+  @apply h-screen;
+  @apply w-64;
+  @apply bg-slate-800;
+  @apply text-white;
+  @apply shadow-md;
+  @apply z-50;
+  @apply flex flex-col;
+}
+.sidebar-profname {
+  @apply block;
+  @apply px-3;
+  @apply py-2;
+  @apply rounded;
+  @apply text-gray-300;
+  @apply bg-slate-800;
+}
+.sidebar-header {
+  @apply p-7;
+  @apply text-2xl;
+  @apply font-bold;
+  @apply border-b;
+  @apply border-gray-700;
+  @apply text-white;
+}
+.sidebar-nav {
+  @apply block;
+  @apply px-4;
+  @apply py-2;
+  @apply rounded;
+  @apply text-gray-300;
+  @apply bg-slate-800;
+}
+.sidebar-welcome {
+  @apply p-4;
+  @apply space-y-4;
+  @apply flex-1;
+}
+.sidebar-button {
+  @apply w-full;
+  @apply bg-slate-800;
+  @apply px-3;
+  @apply py-2;
+  @apply rounded;
+  @apply hover:bg-slate-900;
+}
+.sidebar-footer {
+  @apply p-4;
+  @apply border-t;
+  @apply border-gray-700;
+  @apply flex;
+  @apply flex-col;
+  @apply space-y-4;
+}
+.sidebar-active {
+  @apply bg-slate-700;
+}

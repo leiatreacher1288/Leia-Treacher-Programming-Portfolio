@@ -1,0 +1,118 @@
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - frontend
+      - backend
+    restart: on-failure
+
+  backend:
+    platform: linux/amd64
+    build:
+      context: ./app/backend
+      dockerfile: Dockerfile
+    working_dir: /app
+    entrypoint: ["bash", "./entrypoint.sh"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stdin_open: true
+    tty: true
+    environment:
+      - SERVICE_NAME=backend
+      - LOG_ROOT=/app/logs
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+    volumes:
+      - ./app/backend:/app
+    # REMOVED ports - nginx handles external access now
+    # ports:
+    #   - "8000:8000"
+    expose:
+      - "8000" # Internal exposure for nginx
+    depends_on:
+      - db
+    env_file:
+      - .env
+    restart: on-failure
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c ''import urllib.request; urllib.request.urlopen("http://localhost:8000/api/health/")''',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    platform: linux/amd64
+    build:
+      context: ./app/frontend
+      dockerfile: Dockerfile
+    # REMOVED ports - nginx handles external access now
+    # ports:
+    #   - "5173:5173"
+    expose:
+      - "5173" # Internal exposure for nginx
+    volumes:
+      - ./app/frontend:/app:cached
+      - node_modules:/app/node_modules # Use container-managed node_modules
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    restart: on-failure
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:5173/ || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  db:
+    image: postgres:14
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: examvault
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"  # Expose PostgreSQL port to host
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+
+volumes:
+  postgres_data:
+  pgadmin-data:
+  node_modules:
